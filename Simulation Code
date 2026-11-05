@@ -1,0 +1,122 @@
+import numpy as np
+
+class BL4SOperatorSimulator:
+    def __init__(self, p0=5.0, X0=0.0937):  # X0 for Aluminium in meters (~8.9 cm)
+        self.p0 = p0
+        self.X0 = X0
+        self.c = 3.0e8
+        self.alpha_fs = 1.0 / 137.036
+        self.Lambda_QCD = 0.2  # GeV
+
+        # Rest masses in GeV/c^2
+        self.masses = {
+            'e': 0.000511,
+            'pi': 0.13957,
+            'p': 0.93827
+        }
+
+    def get_energy(self, p, m):
+        return np.sqrt(p**2 + m**2)
+
+    def get_beta(self, p, m):
+        E = self.get_energy(p, m)
+        return p / E
+
+    def compute_jacobian_weight(self, particle_type, dp0=0.1):
+        """1. Relativistic Ensemble Phase-Space Jacobian Weight (W_i)"""
+        m_i = self.masses[particle_type]
+        E_i = self.get_energy(self.p0, m_i)
+
+        # Simplified momentum dispersion distribution w_i
+        w_i = np.exp(- (self.p0 - self.p0)**2 / (2 * dp0**2))
+        normalization_integral = dp0 * np.sqrt(2 * np.pi)
+
+        numerator = (E_i / (self.p0 * self.c**2)) * (w_i / normalization_integral) * (1 + m_i / self.p0) * (1 + m_i / E_i)
+
+        # Sum over all species {e, pi, p}
+        total_sum = 0
+        for p_key, m_val in self.masses.items():
+            E_j = self.get_energy(self.p0, m_val)
+            w_j = w_i
+            term = (E_j / (self.p0 * self.c**2)) * (w_j / normalization_integral) * (1 + m_val / self.p0) * (1 + m_val / E_j)
+            total_sum += term
+
+        return numerator / total_sum
+
+    def compute_transport_operator(self, particle_type, x_vals):
+        """2. Continuous Transport & Moliere Scattering Operator"""
+        m_i = self.masses[particle_type]
+        beta_vals = self.get_beta(self.p0, m_i)
+
+        # Moliere scattering variance approximation along path x
+        theta_moliere = np.sqrt(x_vals) * (13.6 / (beta_vals * self.p0 * self.c)) * np.sqrt(x_vals / self.X0)
+
+        # Transport operator exponential attenuation
+        transport_op = np.exp(- (theta_moliere**2) / (2.0 * (0.01**2)))
+        return transport_op
+
+    def compute_qed_operator(self, particle_type, x_val):
+        """3. Flawless QED Radiative Loop & Form-Factor Operator"""
+        m_i = self.masses[particle_type]
+        E_i = self.get_energy(self.p0, m_i)
+        delta_e_thresh = 0.01 # GeV
+
+        q2_eff = (0.05)**2 * self.p0**2 + (13.6**2 * x_val) / self.X0
+        delta_ie = 1.0 if particle_type == 'e' else 0.0
+
+        qed_op = 1.0 + (2.0 * self.alpha_fs / (3.0 * np.pi)) * \
+                 (np.log(q2_eff / (m_i**2 + self.Lambda_QCD**2)) - 1.0) * \
+                 np.log(max(E_i / delta_e_thresh, 1.001)) * \
+                 (1.0 + (delta_ie * 0.000511 + (1.0 - delta_ie) * m_i) / E_i)
+        return qed_op
+
+    def compute_species_interaction(self, particle_type, x_val):
+        """4. Species-Branching Interaction Operator"""
+        if particle_type == 'e':
+            return np.exp(-x_val / self.X0)
+        else:
+            sigma_hadron = 0.04 # barns
+            rho_na_A = 6.022e23 * 2.7 / 27.0 # density/A for Al
+            return 1.0 - np.exp(-rho_na_A * x_val * sigma_hadron * 1e-24)
+
+    def compute_detection_probability(self, particle_type, x_val):
+        """5. Discrete Detection & Trigger Gates"""
+        m_i = self.masses[particle_type]
+        beta = self.get_beta(self.p0, m_i)
+
+        # Cherenkov threshold condition (n ~ 1.001 for gas radiator)
+        n_ref = 1.001
+        cherenkov_active = 1.0 if (beta * n_ref > 1.0) else 0.05
+        p_cherenkov = 1.0 - np.exp(-x_val * cherenkov_active)
+
+        # Scintillator Landau-Vavilov response gate
+        d_detector = 0.5 * (1.0 + np.tanh((1.5 - 0.2) / 0.1))
+        return p_cherenkov * d_detector
+
+    def evaluate_master_equation(self, particle_type, x_vals):
+        """Evaluates the full Unified Operator Master Framework across path x"""
+        results = []
+        for x in x_vals:
+            W_i = self.compute_jacobian_weight(particle_type)
+            U_trans = self.compute_transport_operator(particle_type, np.array([x]))[0]
+            R_qed = self.compute_qed_operator(particle_type, x)
+            I_species = self.compute_species_interaction(particle_type, x)
+
+            # Psi master operator evaluation
+            psi_val = (U_trans * R_qed * I_species) * W_i
+
+            # Final Stochastic Detection Probability
+            p_det = psi_val * self.compute_detection_probability(particle_type, x)
+            results.append(p_det)
+
+        return np.array(results)
+
+# --- Execution & Verification ---
+if __name__ == "__main__":
+    simulator = BL4SOperatorSimulator(p0=5.0)
+    x_path = np.linspace(0.01, 0.5, 50) # target thickness from 1 cm to 50 cm
+
+    print("--- CERN T9 Beamline Simulation Results ---")
+    for p_type in ['e', 'pi', 'p']:
+        detection_probs = simulator.evaluate_master_equation(p_type, x_path)
+        print(f"Particle: {p_type.upper()} | Mean Detection Probability: {np.mean(detection_probs):.4f} | Max: {np.max(detection_probs):.4f}")
